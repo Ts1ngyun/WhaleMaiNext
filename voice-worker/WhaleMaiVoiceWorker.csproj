@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <DebugType>none</DebugType>
+    <Deterministic>true</Deterministic>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <Compile Include="../WhaleGirl/launcher/AutoVoiceWorker.cs" />
+    <Compile Include="../WhaleGirl/launcher/BreezeSpeech.cs" />
+    <Compile Include="../WhaleGirl/launcher/SpeechProviders.cs" />
+    <Compile Include="../WhaleGirl/launcher/VoiceSendEngine.cs" />
+    <Compile Include="../WhaleGirl/launcher/DownloadedWave.cs" />
+    <Compile Include="../WhaleGirl/launcher/RecordingShortcut.cs" />
+    <EmbeddedResource Include="../WhaleGirl/launcher/Assets/minimax-voices.json"
+                      LogicalName="WhaleLauncher.MiniMaxVoices.json" />
+  </ItemGroup>
+</Project>

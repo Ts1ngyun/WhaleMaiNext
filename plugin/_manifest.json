@@ -1,0 +1,37 @@
+{
+  "manifest_version": 2,
+  "id": "ts1ngyun.whalemai-next",
+  "version": "0.1.0",
+  "name": "WhaleMai Next",
+  "description": "微信图文、API 语音、上下文同步与人工接管桥接",
+  "author": {
+    "name": "Ts1ngyun",
+    "url": "https://github.com/Ts1ngyun"
+  },
+  "license": "AGPL-3.0-only",
+  "plugin_type": "adapter",
+  "host_application": {
+    "min_version": "1.4.5",
+    "max_version": "1.4.5"
+  },
+  "sdk": {
+    "min_version": "2.23.0",
+    "max_version": "2.23.0"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "gateway.route_message",
+    "gateway.update_state",
+    "chat.open_session",
+    "maisaka.context.append"
+  ],
+  "urls": {
+    "repository": "https://github.com/Ts1ngyun/WhaleMaiNext"
+  },
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}

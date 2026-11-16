@@ -1,0 +1,1036 @@
+# -*- coding: utf-8 -*-
+"""Bridge runtime mixin: ReceiverMixin."""
+import html
+import os
+import re
+import threading
+
+import engine as G
+
+
+# 识别一条媒体最多等多久。长截图会拆成 2~3 段、每段一次看图请求（单次请求超时
+# 120 秒），所以图片给得宽一些；但必须有上限：这些活都跑在「同一会话串行」的消息
+# worker 里，不设上限时任何一次卡住都会让整个会话排到最后一条消息过期。
+MEDIA_TIMEOUTS = {'图片': 180.0, '表情': 150.0, '语音': 120.0}
+_MEDIA_TIMEOUT_FALLBACK = 120.0
+
+
+def run_media_with_timeout(recognize, kind, msg, log=None, timeout=None):
+    """在守护线程里跑媒体识别，超时就放弃这一条，先把会话放出来。
+
+    识别链路里有几处天然会长时间阻塞：从微信进程内存里反推图片 AES 密钥、
+    ffmpeg 转 wxgf、视觉 / 语音接口的单次请求超时。它们一旦卡住，同一个会话
+    后面的消息就只能排队 —— 用户看到的是「发了张图 Bot 就死了，重启才好」
+    （2026-11-15 16:15 本机日志）。这里只加时间上限，不改识别本身的行为：
+    超时按「这条不回话」处理，并把原因写回消息，交给调用方统一记 error 日志。
+    """
+    limit = MEDIA_TIMEOUTS.get(kind, _MEDIA_TIMEOUT_FALLBACK) if timeout is None else float(timeout)
+    box = {}
+
+    def work():
+        try:
+            box['text'] = recognize()
+        except BaseException as exc:  # noqa: BLE001 - 识别失败本来就不回话
+            box['err'] = exc
+
+    thread = threading.Thread(target=work, name='media-' + str(kind), daemon=True)
+    thread.start()
+    thread.join(max(0.1, limit))
+    if thread.is_alive():
+        reason = '识别超时（超过 %.0f 秒）' % limit
+        if isinstance(msg, dict):
+            msg['_media_fail'] = reason
+        if log:
+            log('识别超时（%.0f 秒）：类型=%s 消息id=%s:%s'
+                % (limit, kind, (msg or {}).get('shard') or '', (msg or {}).get('local_id')))
+        return ''
+    if 'err' in box:
+        exc = box['err']
+        if isinstance(msg, dict):
+            msg['_media_fail'] = type(exc).__name__
+        if log:
+            log('识别异常：类型=%s 消息id=%s:%s 原因=%s'
+                % (kind, (msg or {}).get('shard') or '', (msg or {}).get('local_id'),
+                   type(exc).__name__))
+        return ''
+    return box.get('text') or ''
+
+
+def image_key_note(db, downloader=None):
+    """图片密钥能不能离线派生：只输出状态，不碰任何密钥内容。"""
+    cfg = None
+    try:
+        cfg = getattr(db, 'cfg_dword', None)
+    except Exception:
+        cfg = None
+    if not cfg and downloader is not None:
+        cfg = getattr(downloader, '_cfg_dword', None)
+    cached = False
+    try:
+        workdir = str(getattr(db, 'workdir', '') or '')
+        cached = bool(workdir) and os.path.exists(os.path.join(workdir, 'image_keys.json'))
+    except Exception:
+        cached = False
+    if cfg:
+        return 'cfgDword 可用（能离线派生）'
+    return 'cfgDword 不可用（只能扫微信进程内存；密钥缓存%s）' % ('有' if cached else '没有')
+
+
+def image_dir_note(db, path):
+    """这张图来自当前账号目录，还是旧目录 / 另一个账号。"""
+    raw_current = str(getattr(db, 'account_dir', '') or '')
+    if not raw_current or not path:
+        return ''
+    try:
+        current = os.path.normcase(os.path.abspath(raw_current))
+        got = os.path.normcase(os.path.abspath(str(path)))
+    except Exception:
+        return ''
+    if not current or not got:
+        return ''
+    if got == current or got.startswith(current.rstrip('\\/') + os.sep):
+        return '当前账号目录'
+    return '非当前账号目录（旧目录或别的账号，密钥可能对不上）'
+
+
+def _nested_quote_text(quoted):
+    """被引用的内容本身还是 XML（多层引用）时，往里剥最多两层拿纯文字。"""
+    for _ in range(2):
+        if quoted.startswith('<') and '<refermsg' in quoted:
+            inner = re.search(r'<refermsg>.*?</refermsg>', quoted, re.S)
+            if inner:
+                content = re.search(r'<content>(.*?)</content>', inner.group(0), re.S)
+                if content:
+                    quoted = html.unescape(content.group(1)).strip()
+                    continue
+        break
+    return quoted
+
+
+def parse_quote_content(content):
+    """把微信的引用消息 XML 拆成 (被引用者, 被引用正文, 这次新打的字)。
+
+    微信的引用回复是 appmsg（57<<32|49，类型名落到「文件/链接/卡片」），正文
+    是一条没有 <url> 的 XML，原来的处理找不到链接就把整条丢掉 —— 用户「引用一句
+    再回」时机器人像没收到。这里取 <refermsg> 里的昵称和原话，再取出引用者这次
+    真正打的字：老版本在最后一个 </msg> 之后，微信 4.x 放在 <title> 里。
+
+    没有完整引用结构或类型不符时返回 None，交给原来的类型分支处理。
+    """
+    if '<refermsg' not in str(content or ''):
+        return None
+    content = str(content)
+    # 字面标签和不完整 XML 都可能出现在普通正文里，不能仅凭子串判为引用。
+    import xml.etree.ElementTree as _et
+    end = content.rfind('</msg>')
+    if end < 0:
+        return None
+    try:
+        root = _et.fromstring(content[:end + len('</msg>')])
+    except _et.ParseError:
+        return None
+    if root.tag != 'msg':
+        return None
+    apps = root.findall('appmsg')
+    if len(apps) > 1:
+        return None
+    envelope = apps[0] if apps else root
+    if len(envelope.findall('refermsg')) != 1:
+        return None
+    quote_type = envelope.findtext('type')
+    if quote_type is not None and quote_type.strip() != '57':
+        return None
+    quoted_by = quoted = ''
+    block = re.search(r'<refermsg>.*?</refermsg>', content, re.S)
+    if block:
+        body = block.group(0)
+        name = re.search(r'<displayname>(.*?)</displayname>', body, re.S)
+        said = re.search(r'<content>(.*?)</content>', body, re.S)
+        quoted_by = html.unescape(name.group(1)).strip() if name else ''
+        quoted = html.unescape(said.group(1)).strip() if said else ''
+    quoted = _nested_quote_text(quoted)
+    tail = html.unescape(content.rsplit('</msg>', 1)[-1]).strip() if '</msg>' in content else ''
+    title = re.search(r'<title>(.*?)</title>', content, re.S)
+    reply = tail or (html.unescape(title.group(1)).strip() if title else '')
+    return quoted_by, quoted, reply
+
+
+def quote_content_text(content):
+    """引用消息转成给模型看的正文；没有可用的引用内容时返回空串。"""
+    parsed = parse_quote_content(content)
+    if parsed is None:
+        return None
+    quoted_by, quoted, reply = parsed
+    if not quoted and not reply:
+        return ''
+    if quoted and reply:
+        return ('（引用%s「%s」）%s' % (quoted_by or '对方', quoted, reply)).strip()
+    if reply:
+        return reply
+    return ('（引用%s「%s」）' % (quoted_by or '对方', quoted)).strip()
+
+
+class ReceiverMixin:
+
+    def _get_media(self):
+        """按需创建媒体下载器；图片和表情识别共用一个实例。
+
+        多条消息现在会并发识别图片，所以创建过程要加锁：否则会同时 new 出
+        两个 MediaDownloader，各自往同一个缓存目录里落文件。
+        """
+        with self._media_lock:
+            if self._media_box['downloader'] is not None:
+                return self._media_box['downloader']
+            save_dir = G.os.path.join(G.ROOT, 'data', 'media-cache')
+            G.os.makedirs(save_dir, exist_ok=True)
+            dl = self.MediaDownloader(self.db, save_dir=save_dir)
+            from image_cache import bind_target_probe
+            bind_target_probe(dl)
+            try:
+                from media_key_compat import install_key_scan_guard
+                install_key_scan_guard(dl, log=G.log)
+                G.log('图片密钥：%s' % image_key_note(self.db, dl))
+            except Exception as _e:
+                G.log('图片密钥扫描护栏没装上（不影响其它识别）：', repr(_e))
+            try:
+                from media_fallback import install_media_fallback
+                installed = install_media_fallback(dl, self.db, log=G.log, root_names=G.DB_ROOT_NAMES)
+                if installed:
+                    G.log('图片目录兜底已就位（%d 处补丁）' % installed)
+            except Exception as _e:
+                G.log('图片目录兜底没装上（默认路径不受影响）：', repr(_e))
+            self._media_box['downloader'] = dl
+            return dl
+
+    def self_identity_ids(self):
+        """所有能代表「自己」的内部 id：真 wxid、账号目录名、目录推出来的 wxid。"""
+        ids = set()
+        values = [getattr(self, 'me', ''), getattr(self, 'self_wxid', ''),
+                  getattr(getattr(self, 'db', None), 'wxid', ''),
+                  getattr(getattr(self, 'db', None), 'account', '')]
+        try:
+            values.append(G.account_wxid(getattr(self.db, 'account', '')))
+        except Exception:
+            pass
+        for value in values:
+            value = str(value or '').strip()
+            if value:
+                ids.add(value)
+        return ids
+
+    def self_mention_names(self, chat=''):
+        """当前「她」在群里可能被 @ 到的名字。
+
+        人设名 + 别名 + 账号昵称 + 账号备注 + 自己 wxid/账号目录，
+        再加群成员表里自己的昵称/备注。缓存 60 秒，避免每条消息都开库；
+        配置热重载会主动清缓存。改名后最多 60 秒自动跟上。
+        """
+        now = G.time.time()
+        cache = getattr(self, '_mention_cache', None)
+        if cache and cache.get('chat') == chat and now - float(cache.get('ts') or 0) < 60:
+            return cache['names']
+
+        info = {}
+        try:
+            info = self.db.get_self_info() or {}
+        except Exception:
+            info = {}
+        nick = str(info.get('nick_name') or '').strip()
+        remark = str(info.get('remark') or '').strip()
+        if nick and nick != getattr(self, '_self_nick', ''):
+            G.log('当前登录账号昵称已更新：', G.safe_name(nick))
+        if nick:
+            self._self_nick = nick
+        else:
+            nick = str(getattr(self, '_self_nick', '') or '').strip()
+
+        persona = (getattr(self, 'cfg', {}) or {}).get('persona') or {}
+        aliases = getattr(self, 'aliases', None) or []
+        group_names = []
+        if str(chat or '').endswith('@chatroom'):
+            ids = self.self_identity_ids()
+            try:
+                for member in self.db.get_group_members(chat) or []:
+                    if str(member.get('username') or '') in ids:
+                        group_names += [member.get('nick_name'), member.get('remark')]
+            except Exception:
+                pass
+
+        names = G.mention.build_names(
+            persona.get('name'), aliases, nick, remark, group_names,
+            sorted(self.self_identity_ids()),
+        )
+        self._mention_cache = {'chat': chat, 'ts': now, 'names': names}
+        if names and names != getattr(self, '_mention_logged', None):
+            self._mention_logged = list(names)
+            G.log('群聊称呼：%s' % (' / '.join(G.safe_name(x) for x in names[:10])))
+        return names
+
+    def is_latest_message(self, username, msg):
+        """这条是不是当前会话的最后一条。
+
+        只有是当前最后一条时，才让 WeChatAuto 走 ``quote_msg(target_text=None)`` 的「引用最近
+        一条」新路径（UIA 行控件 + 像素重心，图片/表情也能定位）。如果生成回复
+        期间又来了新消息，宁可不引用，也不要引用错人。
+        """
+        try:
+            latest = self.db.get_messages(username, limit=1)
+        except Exception:
+            return False
+        if not latest:
+            return False
+        cur = latest[0]
+        return (str(cur.get('local_id')) == str(msg.get('local_id'))
+                and str(cur.get('shard') or '') == str(msg.get('shard') or ''))
+
+    def describe_image(self, msg):
+        try:
+            import base64
+            user = msg.get('username') or ''
+            lid = msg.get('local_id')
+            shard = msg.get('shard')
+            if not user or lid is None:
+                G.log('图片识别跳过：消息缺会话或消息 id')
+                return ''
+            path = None
+            key_missing = False
+            for _attempt in range(4):
+                for _tier in ('full', 'best'):
+                    try:
+                        path = self._get_media().download_image(user, int(lid), tier=_tier, shard=shard)
+                    except Exception as _e:
+                        G.log('图片下载失败（tier=%s）：%r' % (_tier, _e))
+                        path = None
+                        # 密钥取不到时再等也不会变：后面的重试只是白等，直接转界面兜底。
+                        if '密钥' in str(_e):
+                            key_missing = True
+                    if path:
+                        G.log('图片档位：%s → %d KB' % (_tier, G.os.path.getsize(path) // 1024))
+                        _origin = image_dir_note(getattr(self, 'db', None), path)
+                        if _origin and _origin != '当前账号目录':
+                            G.log('图片来源：%s' % _origin)
+                        break
+                if path or key_missing:
+                    break
+                if _attempt < 3:
+                    G.log('图片缓存尚未就绪，等待重试（%d/3）' % (_attempt + 1))
+                    G.time.sleep((0.5, 1.0, 2.0)[_attempt])
+            if key_missing and not path:
+                G.log('图片密钥取不到，跳过缓存重试，直接走界面兜底')
+            raw = b''
+            if path:
+                with open(path, 'rb') as f:
+                    raw = f.read()
+            else:
+                G.log('图片读取失败：已重试；请确认接收端微信已下载图片（消息id=%s，分片=%s）' % (lid, shard))
+                try:
+                    _key_note = image_key_note(getattr(self, 'db', None), self._get_media())
+                except Exception:
+                    _key_note = '密钥状态未知'
+                G.log_throttled('img-keys:' + _key_note,
+                                '图片密钥状态：%s；消息id=%s' % (_key_note, lid))
+                # 磁盘这条路走不通（多半是密钥取不到）：退到界面兜底，让微信自己
+                # 把画出来的图交出来（导出明文 / 截预览窗）。失败只是这一条不回话。
+                fallback = getattr(self, 'image_ui_fallback', None)
+                raw = fallback(msg) if callable(fallback) else b''
+                if not raw:
+                    if isinstance(msg, dict):
+                        msg['_media_fail'] = '本地图片解不开，界面兜底也没取到'
+                    return ''
+            if len(raw) > 8 * 1024 * 1024:
+                G.log('图片太大，跳过')
+                return ''
+            if raw[:4] == b'wxgf':
+                try:
+                    conv = self._get_media()._wxgf_to_jpg(raw)
+                except Exception as _e:
+                    conv = None
+                    G.log('wxgf 转码异常：', repr(_e))
+                if not conv:
+                    G.log('这张图是 wxgf/HEVC，本机 ffmpeg 没能转出来；改走界面兜底（请同时检查桥接启动时的 ffmpeg 状态）')
+                    fallback = getattr(self, 'image_ui_fallback', None)
+                    conv = fallback(msg) if callable(fallback) else b''
+                    if not conv:
+                        if isinstance(msg, dict):
+                            msg['_media_fail'] = 'wxgf 转码失败，界面兜底也没取到'
+                        return ''
+                raw = conv
+                ext = '.jpg'
+            elif raw[:8] == b'\x89PNG\r\n\x1a\n':
+                ext = '.png'
+            elif raw[:3] == b'\xff\xd8\xff':
+                ext = '.jpg'
+            elif raw[:3] == b'GIF':
+                ext = '.gif'
+            else:
+                ext = G.os.path.splitext(path or '')[1].lower()
+                if ext not in ('.jpg', '.jpeg', '.png', '.gif'):
+                    G.log('图片格式不认识（%s），跳过' % raw[:4])
+                    return ''
+            mime = 'image/png' if ext == '.png' else 'image/gif' if ext == '.gif' else 'image/jpeg'
+            import maibot_async
+            if maibot_async.enabled():
+                # Forward real image bytes to MaiBot; recognition belongs to its VLM.
+                import io
+                from PIL import Image, ImageOps
+                img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert('RGB')
+                img.thumbnail((2048, 2048))
+                encoded = io.BytesIO()
+                img.save(encoded, format='JPEG', quality=85)
+                if len(encoded.getvalue()) > 1100000:
+                    img.thumbnail((1280, 1280)); encoded = io.BytesIO()
+                    img.save(encoded, format='JPEG', quality=75)
+                msg['_mai_image'] = base64.b64encode(encoded.getvalue()).decode('ascii')
+                return '图片已交给麦麦处理，消息id=%s' % lid
+            base = self.bot_url.rsplit('/webhook', 1)[0]
+            parts = [raw]
+            try:
+                from PIL import Image
+                import io as _io
+                img = Image.open(_io.BytesIO(raw))
+                img.load()
+                w, h = img.size
+                if w > 0 and h / float(w) > 2.2 and (h > 1200):
+                    n = 3 if h / float(w) > 4.0 else 2
+                    overlap = int(h * 0.08)
+                    parts = []
+                    for i in range(n):
+                        top = max(0, int(i * h / n) - (overlap if i else 0))
+                        bottom = min(h, int((i + 1) * h / n) + overlap)
+                        seg = img.crop((0, top, w, bottom)).convert('RGB')
+                        buf = _io.BytesIO()
+                        seg.save(buf, format='JPEG', quality=88)
+                        parts.append(buf.getvalue())
+                    mime = 'image/jpeg'
+                    G.log('长截图 %dx%d，切成 %d 段分别识别' % (w, h, len(parts)))
+                    mime = 'image/jpeg'
+                else:
+                    img2 = img.convert('RGB')
+                    buf = _io.BytesIO()
+                    img2.save(buf, format='JPEG', quality=88)
+                    parts = [buf.getvalue()]
+                    mime = 'image/jpeg'
+            except Exception as _e:
+                G.log('图片预处理跳过（用原图）：', repr(_e))
+                parts = [raw]
+            texts = []
+            for idx, part in enumerate(parts):
+                prompt = ''
+                if len(parts) > 1:
+                    prompt = '这是一张长截图从上往下的第 %d/%d 段。逐条转写这一段里的文字（分清左边对方/右边本人），不要省略。' % (idx + 1, len(parts))
+                r = G.LOCAL_HTTP.post(base + '/api/vision', json={'image': base64.b64encode(part).decode(), 'mime': mime, 'prompt': prompt}, timeout=120)
+                data = r.json()
+                piece = str(data.get('text') or '').strip()
+                if piece:
+                    texts.append(piece)
+                if not data.get('ok', True):
+                    G.log_throttled('img-fail:' + str(data.get('error'))[:40], '第 %d 段识别失败：%s' % (idx + 1, data.get('error')))
+            text = '\n'.join(texts).strip()
+            if len(text) > 1200:
+                text = text[:1200] + '…'
+            G.log('图片识别：', G.safe_text(text))
+            return text
+        except Exception as e:
+            if isinstance(msg, dict):
+                msg['_media_fail'] = type(e).__name__
+            G.log_throttled('img-exc:' + type(e).__name__, '图片识别失败：', repr(e))
+            return ''
+
+    def image_ui_fallback(self, msg):
+        """磁盘图片解不开时的界面兜底：让微信导出明文，或截预览窗。
+
+        只在 ``describe_image`` 确认本地取不到图 / 解不开图之后调用；所有副作用
+        （点气泡、开预览窗、保存对话框）都在 ``image_ui_fallback`` 模块里，并且
+        整段有时间上限。失败返回 ``b''``，按「这条不回话」处理。
+        """
+        try:
+            from image_ui_fallback import read_image_via_ui
+            media = self._get_media()
+            try:
+                chat_name = self.display_name(msg.get('username') or '')
+            except Exception:
+                chat_name = ''
+            # 界面兜底真的会点鼠标/开预览窗：必须和发送串行，否则两条消息同时
+            # 操作微信窗口会把点击落到别人的会话上。
+            lock = getattr(self, 'send_lock', None)
+            acquired = False
+            try:
+                if lock is not None:
+                    acquired = lock.acquire(timeout=5)
+                    if not acquired:
+                        G.log('界面兜底：发送还在进行，这次先跳过（不抢窗口）')
+                        return b''
+            except Exception:
+                acquired = False
+            try:
+                return read_image_via_ui(media, msg, chat_name=chat_name,
+                                         save_dir=getattr(media, 'save_dir', None), log=G.log)
+            finally:
+                if acquired:
+                    try:
+                        lock.release()
+                    except Exception:
+                        pass
+        except Exception as exc:  # noqa: BLE001 - 兜底失败不影响其它消息
+            G.log('界面兜底异常：消息id=%s:%s 原因=%s(%s)'
+                  % (msg.get('shard') or '', msg.get('local_id'),
+                     type(exc).__name__, str(exc)[:120]))
+            return b''
+
+    def describe_emoji(self, msg):
+        """表情包 → 文字描述；失败返回空串（调用方跳过，不回话）。"""
+        try:
+            import base64
+            from emoji_vision import load_preview, save_original
+
+            def collect_original(raw, image_format):
+                try:
+                    save_original(G.os.path.join(G.ROOT, 'data', '收集的表情包'), raw, image_format)
+                except OSError as exc:
+                    G.log('表情包收集失败 type=%s code=%s status= detail=保存原图失败' % (type(exc).__name__, exc.errno or ''))
+
+            collect = {'on_original': collect_original} if getattr(G, 'STICKER_COLLECT', False) else {}
+            preview = None
+            for attempt in range(4):
+                preview = load_preview(self.db.account_dir, msg.get('content'), allow_network=attempt == 3, **collect)
+                if preview:
+                    break
+                if attempt < 3:
+                    G.time.sleep((0.5, 1.0, 2.0)[attempt])
+            if not preview:
+                G.log('表情包读取失败：本地缓存不可解码，且消息没有可取得的原图')
+                return ''
+            raw, frames = preview
+            prompt = '这是对方发来的表情包。简短描述主体、表情、动作和画面文字，看不清就说明，不要编造。'
+            if frames > 1:
+                prompt += '从左到右是同一动画的%d个抽样帧，结合它们理解，不要当成不同图片；未展示的动作不要猜。' % frames
+            response = G.LOCAL_HTTP.post(self.bot_url.rsplit('/webhook', 1)[0] + '/api/vision', json={'image': base64.b64encode(raw).decode(), 'mime': 'image/png', 'prompt': prompt}, timeout=120)
+            data = response.json()
+            if not data.get('ok'):
+                G.log('表情包识图接口失败：', str(data.get('error') or '未知错误')[:160])
+                return ''
+            text = str(data.get('text') or '').strip()[:1200]
+            G.log('表情包识别（%d帧）：%s' % (frames, G.safe_text(text)))
+            return text
+        except Exception as exc:
+            if isinstance(msg, dict):
+                msg['_media_fail'] = type(exc).__name__
+            G.log('表情包识别异常：', type(exc).__name__)
+            return ''
+
+    def transcribe_voice(self, msg):
+        """语音消息 → 文字；失败返回空串。"""
+        # 使用本条消息的完整快照，防止并行识别时切换服务商混用地址和 Key。
+        voice = G.voice_runtime() if callable(getattr(G, 'voice_runtime', None)) else {
+            name: getattr(G, name) for name in ('VOICE_ENABLED', 'VOICE_API_KEY', 'VOICE_MODEL',
+                'VOICE_BASE_URL', 'VOICE_TIMEOUT', 'VOICE_MAX_SECONDS')}
+        if not voice['VOICE_ENABLED']:
+            G.log('语音识别已关闭（voice.enabled=false）')
+            return ''
+        if voice.get('VOICE_SUPPORTED') is False:
+            G.log_throttled('voice-provider-unsupported', '当前聊天接口尚未适配语音识别，请在设置 → API 接入 → 语音（识别）手动选择服务')
+            return ''
+        if not voice['VOICE_API_KEY']:
+            G.log_throttled('voice-key-missing', '语音识别缺少对应服务商的 Key，请在设置 → API 接入配置聊天 Key 或语音专用 Key')
+            return ''
+        try:
+            import io
+            import wave
+            user = msg.get('username') or ''
+            lid = msg.get('local_id')
+            shard = msg.get('shard')
+            if not user or lid is None:
+                G.log('语音识别跳过：消息缺会话或消息 id')
+                return ''
+            path = self._get_media().download_voice(user, int(lid), shard=shard)
+            if not path:
+                G.log('语音没落盘（这条微信没缓存到本地），跳过')
+                return ''
+            try:
+                import pysilk
+            except Exception:
+                G.log('缺少 pysilk，装一下：pip install silk-python')
+                return ''
+            pcm = io.BytesIO()
+            with open(path, 'rb') as f:
+                pysilk.decode(f, pcm, G.VOICE_SAMPLE_RATE)
+            raw = pcm.getvalue()
+            seconds = len(raw) / float(G.VOICE_SAMPLE_RATE * 2)
+            if seconds < 0.3:
+                G.log('语音太短（%.1fs），跳过' % seconds)
+                return ''
+            if seconds > voice['VOICE_MAX_SECONDS']:
+                G.log('语音太长（%.0fs > %.0fs），跳过' % (seconds, voice['VOICE_MAX_SECONDS']))
+                return ''
+            wav_path = G.os.path.splitext(path)[0] + '.wav'
+            try:
+                with wave.open(wav_path, 'wb') as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(G.VOICE_SAMPLE_RATE)
+                    w.writeframes(raw)
+                with open(wav_path, 'rb') as f:
+                    text = G.asr_transcribe(f.read(), voice['VOICE_API_KEY'], voice['VOICE_MODEL'], voice['VOICE_BASE_URL'], voice['VOICE_TIMEOUT'], voice.get('VOICE_PROVIDER', G.VOICE_PROVIDER))
+            finally:
+                try:
+                    G.os.remove(wav_path)
+                except Exception:
+                    pass
+            text = G.clean_transcript(text)
+            G.log('语音识别（%.1fs）：%s' % (seconds, G.safe_text(text) if text else '（空）'))
+            return text
+        except Exception as e:
+            if isinstance(msg, dict):
+                msg['_media_fail'] = type(e).__name__
+            G.log_throttled('voice-fail:' + type(e).__name__, '语音识别失败：', repr(e))
+            return ''
+
+    def on_message_inner(self, msg, listener):
+        import maibot_async
+        if not maibot_async.allow_media(msg):
+            return
+
+        def media_failed(kind):
+            """识别失败补一条能把「哪条、谁的、为什么没回」对上的 error 日志。
+
+            以前失败只在识别函数里留零散日志（连消息 id 都没有），事后完全没法回答
+            「这条消息她为什么没回」。节流 key 带消息 id：同一条反复失败只记一次，
+            别的消息照常各记一条，不会被节流误吞。图片失败不再直接沉默，会把
+            「没取到图」的说明交给模型回一句（见下面的占位文本）。
+            """
+            msg_id = '%s:%s:%s' % (username, msg.get('shard') or '', msg.get('local_id'))
+            try:
+                chat = self.display_name(username)
+            except Exception:
+                chat = username
+            sender = msg.get('sender_username') or ''
+            try:
+                who = self.db.get_nickname(sender) or ''
+            except Exception:
+                who = ''
+            if not who:
+                who = '群友' if username.endswith('@chatroom') else '微信好友'
+            reason = msg.pop('_media_fail', None) or '空描述（识别结果为空）'
+            G.log_throttled('media-fail:%s:%s' % (msg_id, kind), '识别失败：会话=%s 发送者=%s 类型=%s 消息id=%s 原因=%s' % (G.safe_id(chat), G.safe_name(who), kind, msg_id, reason), emit=G.log_error)
+
+        def skipped(reason):
+            """每条没处理的消息都留痕：排查「她为什么没回」不能只靠猜。
+
+            同一个会话同一种原因 60 秒内只打一行（并给出被折叠的条数），
+            正常聊天不会被刷屏，出问题时又能看到到底卡在哪一步。
+            """
+            G.log_throttled(
+                'msg-skip:%s:%s' % (reason, msg.get('username') or ''),
+                '消息未处理：%s；会话=%s 消息id=%s:%s:%s'
+                % (reason, G.safe_id(msg.get('username') or ''),
+                   msg.get('username') or '', msg.get('shard') or '', msg.get('local_id')),
+                ttl=60,
+            )
+
+        try:
+            username = msg.get('username') or ''
+            if not username:
+                skipped('消息缺少会话标识')
+                return
+            sender = msg.get('sender_username') or ''
+            if sender == self.me:
+                skipped('自己发出的消息')
+                return
+            mtype = msg.get('type') or ''
+            content = G.fix_garbled((msg.get('content') or '').strip())
+            media_placeholder = False
+            is_emoji = mtype in ('表情', '动画表情') or (mtype == '图片' and '<emoji' in content)
+            if is_emoji:
+                desc = run_media_with_timeout(lambda: self.describe_emoji(msg), '表情', msg, G.log)
+                if not desc:
+                    media_failed('表情')
+                    return
+                content = '（对方发了一个表情包，画面是：%s）' % desc
+            elif mtype == '图片':
+                desc = run_media_with_timeout(lambda: self.describe_image(msg), '图片', msg, G.log)
+                if not desc:
+                    # 取不到图就装没看见，用户只会觉得「又卡死了」。改成让她自然地回一句：
+                    # 明确禁止编造画面，只允许问一句 / 让对方再发。
+                    media_failed('图片')
+                    content = ('（对方发了一张图片，但这边没取到、也看不清。'
+                               '不要编造图里的内容；可以自然地回一句，比如问对方图怎么了、'
+                               '或让对方再发一次 / 说说图里是什么）')
+                    media_placeholder = True
+                else:
+                    content = '（对方发了一张图片，图里是：%s）' % desc
+            if mtype == '语音':
+                said = run_media_with_timeout(lambda: self.transcribe_voice(msg), '语音', msg, G.log)
+                if not said:
+                    G.log('语音没识别出内容，先不说话')
+                    media_failed('语音')
+                    return
+                content = '（对方发了一条语音，说的是：%s）' % said
+            # 引用回复：微信存的是 appmsg XML（类型名落到「文件/链接/卡片」），
+            # 原来的分支找不到 <url> 就把整条丢掉。这里先拆出被引用原话和新打的字。
+            _quote_text = quote_content_text(content) if mtype not in ('文本', '语音', '图片', '表情', '动画表情') else None
+            _quote_parsed = _quote_text is not None
+            if _quote_parsed:
+                if not _quote_text:
+                    skipped('引用消息里没有可读内容')
+                    return
+                content = _quote_text
+            if not _quote_parsed and mtype not in ('文本', '语音', '图片', '表情', '动画表情'):
+                if '移出群聊' in content or '移出' in content:
+                    self.dead_chats.add(username)
+                    G.log('被移出群聊，停掉这个会话：', G.safe_name(self.display_name(username)))
+                    return
+                _low = content.lower()
+                if 'finderfeed' in _low or '<type>51</type>' in _low or ('视频号' in content and '<url>' in _low):
+                    G.log('收到视频号卡片，装死（不识别不回）')
+                    return
+                import re as _re
+                mu = _re.search('<url>(.*?)</url>', content, _re.S)
+                mt = _re.search('<title>(.*?)</title>', content, _re.S)
+                if mu:
+                    title = (mt.group(1).strip() if mt else '')[:60]
+                    content = '分享了一个链接：%s %s' % (title, mu.group(1).strip())
+                else:
+                    skipped('卡片/链接/文件消息没有可读正文（类型=%s）' % (mtype or '未知'))
+                    return
+            if G.ONLY_CHATS:
+                try:
+                    if self.display_name(username) not in G.ONLY_CHATS:
+                        skipped('不在白名单会话内')
+                        return
+                except Exception:
+                    skipped('白名单核对失败（读不到会话名）')
+                    return
+            if mtype == '文本' and not _quote_parsed:
+                content = G.fix_garbled((msg.get('content') or '').strip())
+                if username.endswith('@chatroom'):
+                    content = G._GROUP_SENDER_PREFIX_RE.sub('', content, count=1).strip()
+            if not content or (content.startswith('<') and mtype != '文本'):
+                skipped('正文为空，或仍是没解析出来的 XML（类型=%s）' % (mtype or '未知'))
+                return
+            is_group = username.endswith('@chatroom')
+            nickname = ''
+            try:
+                nickname = self.db.get_nickname(sender) or ''
+            except Exception:
+                nickname = ''
+            if not nickname:
+                nickname = '群友' if is_group else '微信好友'
+            if G.is_system_notice(username, nickname, content):
+                if G.ONLY_CHATS:
+                    skipped('系统通知（白名单模式）')
+                    return
+                G.log('跳过系统通知：', G.safe_name(nickname), '：', G.safe_text(content))
+                return
+            # 取不到图的占位文本对同一个会话是固定的：如果直接拿去查重，连发两张图
+            # 的第二张会被当成「重复消息」丢掉。所以占位文本按消息 id 查重，
+            # 只挡微信真的把同一条消息重复投递的情况。
+            _guard_text = content
+            if media_placeholder:
+                _guard_text = '%s#%s:%s' % (content, msg.get('shard') or '', msg.get('local_id'))
+            if G.duplicate_guard(username, sender, _guard_text):
+                G.log('跳过重复消息：', G.safe_name(nickname), '：', G.safe_text(content))
+                return
+            if '拍了拍' in content and '<url>' not in content:
+                G.log('跳过拍一拍提示：', G.safe_text(content))
+                return
+            _names = self.self_mention_names(username) if is_group else []
+            _mention = G.mention.analyze(
+                content, _names, self.display_name(username) if is_group else '')
+            addressed = bool(_mention['addressed'])
+            _structured = None
+            if is_group and '@' in content:
+                # 优先用 source 里的 atuserlist（wxid），昵称改名也不会漏；
+                # 读不到再退回显示名匹配。
+                _structured = G.mention_meta.self_mentioned(
+                    self.db, username, msg, self.self_identity_ids())
+                if _structured is not None:
+                    addressed = bool(_structured)
+            _bare_mention = _mention['bare_any'] if _structured else _mention['bare_self']
+            if username.endswith('@chatroom') and addressed and _bare_mention:
+                try:
+                    for m in self.db.get_messages(username, limit=12):
+                        if m.get('type') != '文本':
+                            continue
+                        if (m.get('sender_username') or '') != sender:
+                            continue
+                        prev = G.fix_garbled((m.get('content') or '').strip())
+                        prev = __import__('re').sub('^[A-Za-z0-9_\\-]{4,}:\\s*', '', prev).strip()
+                        # 上一条如果已经叫过她，就不是「裸 @ 补问题」的素材。
+                        # 这里必须用和 @ 解析同一套名字/归一化，不能用短别名的子串匹配。
+                        if prev and not G.mention.contains_name(prev, _names):
+                            content = prev
+                            G.log('补上一条问题：', G.safe_text(prev))
+                            break
+                except Exception as e:
+                    G.log('补问题失败：', repr(e))
+            _mentioned_names = list(_mention['mentioned_names'])
+            if is_group and not addressed and '@' in content:
+                # 同一组「@对象」在每个群只提醒一次，避免正常 @ 别人也刷屏。
+                # 这次「@许愿 被跳过」如果留着这条日志，一眼就能看到称呼表不对。
+                G.log_throttled(
+                    'mention-miss:%s:%s' % (
+                        username, ','.join(sorted(_mentioned_names[:4])) or '?'),
+                    '群消息含 @ 但没认出是叫我：@对象=%s 当前称呼=%s 会话=%s 消息id=%s:%s'
+                    % (','.join(G.safe_name(x) for x in _mentioned_names[:4]) or '-',
+                       ','.join(G.safe_name(x) for x in _names[:6]) or '-',
+                       G.safe_id(username), msg.get('shard') or '', msg.get('local_id')),
+                )
+            G.log('收到', '群' if is_group else '私聊', G.safe_name(self.display_name(username)), '←', G.safe_name(nickname), '（%d 字）' % len(content))
+            # 给内核的只放显示名；wxid/账号目录只参与 @ 元数据判断，别拿去匹配正文。
+            try:
+                _ids = self.self_identity_ids()
+            except Exception:
+                _ids = set()
+            _payload_names = [n for n in (_names or []) if n not in _ids]
+            payload = {'chat_id': username, 'chat_type': 'group' if is_group else 'private', 'user_id': sender or 'unknown', 'senderId': sender or 'unknown', 'sender_id': sender or 'unknown', 'senderName': nickname, 'nickname': nickname, 'text': content, 'msg_id': '%s:%s:%s' % (username, msg.get('shard') or '', msg.get('local_id')), 'at_me': addressed, 'mentioned_names': _mentioned_names, 'self_names': _payload_names, 'chat_title': self.display_name(username) if is_group else ''}
+            if msg.get('_mai_image'):
+                payload['image_base64'] = msg.pop('_mai_image')
+            try:
+                headers = {'x-whale-bridge': '1'}
+                if self.token:
+                    headers['x-bot-token'] = self.token
+                # 模型生成耗时由内核控制，桥接不再用 120 秒读超时截断本轮回复。
+                r = G.LOCAL_HTTP.post(self.bot_url, json=payload, headers=headers, timeout=(10, None))
+                if r.status_code != 200:
+                    G.CONN_STATE['ok'] = False
+                    hint = '桥接 token 不匹配，请核对配置并重启桥接' if r.status_code in (401, 403) else '请查看内核诊断日志'
+                    G.log_throttled('webhook-http:' + str(r.status_code), '鲸鲸接口返回 HTTP %s：%s' % (r.status_code, hint))
+                    return
+                data = r.json()
+                if not isinstance(data, dict) or data.get('ok') is not True:
+                    G.CONN_STATE['ok'] = False
+                    G.log_throttled('webhook-response', '鲸鲸接口返回异常，未发送回复')
+                    return
+                if data.get('skipped') == 'adapter_disabled':
+                    G.log_throttled('adapter-disabled', '微信网关未开启，请在启动器设置中开启 gateway.wechat.enabled')
+                    return
+            except Exception as e:
+                _msg = repr(e)
+                if '10061' in _msg or 'refused' in _msg.lower() or '积极拒绝' in _msg:
+                    G.log_throttled('conn-refused', '连不上本地服务（积极拒绝 = 127.0.0.1 上没有程序在监听）。先在启动器里点「启动」，等状态变成「运行中」再来。')
+                    if G.CONN_STATE.get('ok') is not False:
+                        G.CONN_STATE['ok'] = False
+                else:
+                    G.log_throttled(
+                        'webhook-fail:' + _msg[:40],
+                        '请求鲸鲸失败：会话=%s 消息id=%s:%s:%s 原因=%s'
+                        % (G.safe_name(self.display_name(username)), msg.get('shard') or '',
+                           msg.get('local_id'), type(e).__name__, _msg[:120]),
+                    )
+                return
+            if G.CONN_STATE.get('ok') is not True:
+                G.CONN_STATE['ok'] = True
+                G.log('已连上鲸鲸服务：', self.bot_url.rsplit('/webhook', 1)[0])
+            if data.get('action') != 'reply' or not data.get('reply'):
+                # 私聊也要留一条：否则“为什么没回”在日志里完全空白。
+                G.log_throttled(
+                    'no-reply:%s:%s' % (username, msg.get('local_id')),
+                    '鲸鲸没接话：%s 会话=%s 消息id=%s:%s 原因=%s 字数=%d'
+                    % (G.safe_name(nickname), G.safe_id(self.display_name(username)), msg.get('shard') or '',
+                       msg.get('local_id'), data.get('reason'), len(content)),
+                )
+                return
+            if data.get('mock') and (not G.MOCK_NOTICED['done']):
+                G.MOCK_NOTICED['done'] = True
+                G.log('[!] 服务端现在是「演示模式」：没配置 API Key，她回的是内置台词，不是真模型。')
+                G.log('    去启动器「设置」填一把 Key（DeepSeek / 智谱 都行）就会切成真模型。')
+            target = self.display_name(username)
+            bubbles = data.get('bubbles')
+            if not isinstance(bubbles, list):
+                bubbles = [data['reply']]
+            bubbles = [line for line in bubbles if isinstance(line, str) and line.strip()]
+            if not bubbles:
+                bubbles = [str(data['reply'])]
+            mention = str(data.get('mention') or '').strip()
+            if not G.rate_guard(username):
+                if isinstance(data.get('sticker'), dict):
+                    self.cancel_reply_sticker(data['sticker'], username)
+                G.log('这一分钟回太多了，先停一下：', G.safe_name(target))
+                return
+            if data.get('stickerOnly') is True:
+                sticker = data.get('sticker')
+                if G.STICKER_TEST_ON and isinstance(sticker, dict):
+                    self.claim_and_send_sticker(sticker, expected_chat=target, expected_username=username)
+                return
+            G.log('[delivery] stage=reply chatType=%s bubbles=%d chars=%d' % ('group' if is_group else 'private', len(bubbles), sum((len(x or '') for x in bubbles))))
+            first = True
+            if data.get('error') or data.get('commandType'):
+                G.log('[voice] stage=decision result=skip reason=error_or_command_reply')
+            elif data.get('separateText'):
+                G.log('[voice] stage=decision result=skip reason=separate_text_requested')
+            elif G.voice_reply.choose(G.voice_reply.settings(G.ROOT), content, is_group, G.random.random, log=G.log):
+                spoken = '\n'.join((line.strip() for line in bubbles if line.strip()))
+                if self.send_voice_reply(spoken, target, username):
+                    if isinstance(data.get('sticker'), dict):
+                        self.cancel_reply_sticker(data['sticker'], username)
+                    G.log('[delivery] stage=voice result=handled textFallback=false stickerFallback=false reason=voice_may_have_sent')
+                    return
+                G.log('[voice] stage=delivery result=text_fallback reason=prepare_or_synthesis_failed')
+            for line in bubbles:
+                if not line:
+                    continue
+                if first and mention and is_group:
+                    body = line
+                    for prefix in ('@%s' % mention, '@ %s' % mention):
+                        if body.startswith(prefix):
+                            body = body[len(prefix):].lstrip(' ，,：:')
+                            break
+                    if self.send_at(mention, body, target, username):
+                        first = False
+                        G.time.sleep(0.6)
+                        continue
+                    G.log('真 @ 失败，退回普通文本：', G.safe_name(mention))
+                    if not line.startswith('@'):
+                        line = '@%s %s' % (mention, line)
+                quote_latest = bool(first and G.QUOTE_REPLY
+                                    and data.get('commandType') != 'admin_spell'
+                                    and self.is_latest_message(username, msg))
+                if not self.send_text(line, target, username, quote_latest=quote_latest):
+                    if isinstance(data.get('sticker'), dict):
+                        self.cancel_reply_sticker(data['sticker'], username)
+                    G.log('[delivery] stage=text result=failed reason=send_failed remainingBubbles=cancelled stickers=cancelled')
+                    return
+                first = False
+                G.time.sleep(0.6)
+            _stk = data.get('sticker') or None
+            if G.STICKER_TEST_ON and isinstance(_stk, dict):
+                self.claim_and_send_sticker(_stk, expected_chat=target, expected_username=username)
+            elif G.STICKER_TEST_ON:
+                G.log('[sticker] stage=delivery result=skip reason=no_job_in_reply')
+        except Exception as e:
+            G.log('处理消息异常：会话=%s 消息id=%s:%s 原因=%r'
+                  % (G.safe_id(msg.get('username') or ''),
+                     msg.get('shard') or '', msg.get('local_id'), e))
+
+    def merge_text_batch(self, run, username):
+        """同一个人连发的一串纯文本 → 合成一条消息交给服务端。
+
+        只合并正文和消息 id；发送者、会话、shard 沿用最后一条。
+        群消息正文前面带的 "wxid_xxx:" 前缀要先逐条剥掉，不然合并后
+        模型会看到一串 wxid（原来每条各自剥，合并后只剥一次就漏了）。
+        """
+        merged = dict(run[-1])
+        parts = []
+        ids = []
+        for m in run:
+            text = G.fix_garbled((m.get('content') or '').strip())
+            if username.endswith('@chatroom'):
+                text = G._GROUP_SENDER_PREFIX_RE.sub('', text, count=1).strip()
+            if text:
+                parts.append(text)
+            ids.append(str(m.get('local_id')))
+        if not parts:
+            return [run[-1]]
+        merged['content'] = '\n'.join(parts)
+        merged['local_id'] = '|'.join(ids)
+        G.log('合并 %d 条连发消息一起回：%s' % (len(run), G.safe_text(' / '.join(parts))))
+        return [merged]
+
+    def flush_chat(self, chat, listener):
+        """这个会话的上一轮跑完了：把攒下的消息取走，逐组处理。
+
+        同一轮里同一个人连发的几条合成一条（只调一次模型、只发一次），
+        不同人的消息分开回，顺序不乱。
+        """
+        try:
+            items = self.batches.take(chat)
+        except Exception as e:
+            G.log('取消息批次失败：', repr(e))
+            return
+        if not items:
+            return
+        for run in G.split_runs(items):
+            username = (run[0] or {}).get('username') or ''
+            todo = self.merge_text_batch(run, username) if G.mergeable(run) else run
+            for msg in todo:
+                try:
+                    self.on_message_inner(msg, listener)
+                except Exception as e:
+                    G.log('处理消息异常：会话=%s 消息id=%s:%s 原因=%r'
+                          % (G.safe_id((msg or {}).get('username') or ''),
+                             (msg or {}).get('shard') or '',
+                             (msg or {}).get('local_id'), e))
+
+    def on_message(self, msg, listener):
+        try:
+            username = msg.get('username') or ''
+            create_time = float(msg.get('create_time') or 0)
+            if create_time and create_time < G.START_TS - G.SKIP_OLDER_THAN:
+                G.log_throttled(
+                    'msg-too-old:%s' % (username or 'unknown'),
+                    '消息未处理：早于本次启动太多（消息id=%s:%s，创建时间=%s）'
+                    % (msg.get('shard') or '', msg.get('local_id'), int(create_time)),
+                    ttl=60,
+                )
+                return
+            if create_time and G.time.time() - create_time > G.STALE_AFTER:
+                G.log('跳过过期消息（%.0fs 前）：%s' % (G.time.time() - create_time, G.safe_text(msg.get('content') or '')))
+                return
+            if self.me and msg.get('sender_username') == self.me:
+                import maibot_async
+                if maibot_async.enabled():
+                    maibot_async.sync_self(self, msg)
+                return
+            chat = username or 'unknown'
+            pushed = self.batches.push(chat, msg)
+            # 纯文本走安静窗口。注意：第一条把 chat 标成 queued 后，后续 push 返回
+            # False，所以不能拿 pushed 当“要不要重置计时”的条件。
+            if (msg.get('type') or '') == '文本':
+                try:
+                    self.settle.touch(chat, username.endswith('@chatroom'))
+                except Exception as e:
+                    # 收集器异常时退回旧行为：立刻提交一次，别把消息闷在 batches 里。
+                    G.log('消息收集失败，改为立即处理：', repr(e))
+                    try:
+                        queued = self.pipeline.submit(chat, self.flush_chat, chat, listener)
+                    except Exception as inner:
+                        queued = False
+                        G.log('消息入队失败：', repr(inner))
+                    if not queued:
+                        self.batches.release(chat)
+                        G.log_throttled(
+                            'queue-closed:%s' % chat,
+                            '消息没能排上队（调度已关闭）：会话=%s 消息id=%s:%s'
+                            % (G.safe_id(chat), msg.get('shard') or '', msg.get('local_id')),
+                            ttl=60,
+                        )
+            elif pushed:
+                # 图片/语音/卡片等不合并，仍立即走旧流程。
+                try:
+                    queued = self.pipeline.submit(chat, self.flush_chat, chat, listener)
+                except Exception as inner:
+                    queued = False
+                    G.log('消息入队失败：', repr(inner))
+                if not queued:
+                    self.batches.release(chat)
+                    G.log_throttled(
+                        'queue-closed:%s' % chat,
+                        '消息没能排上队（调度已关闭）：会话=%s 消息id=%s:%s'
+                        % (G.safe_id(chat), msg.get('shard') or '', msg.get('local_id')),
+                        ttl=60,
+                    )
+        except Exception as e:
+            G.log('提交消息处理失败：', repr(e))
+
+    def recent_chats(self, limit=2, within=1800):
+        out = []
+        try:
+            for s in self.db.get_sessions(limit=20):
+                u = s.get('username') or ''
+                if not u or u == 'filehelper':
+                    continue
+                try:
+                    ms = self.db.get_messages(u, limit=1)
+                except Exception:
+                    continue
+                if not ms:
+                    continue
+                t = float(ms[0].get('create_time') or 0)
+                if t and G.time.time() - t > within:
+                    continue
+                out.append((u, self.display_name(u)))
+                if len(out) >= limit:
+                    break
+        except Exception:
+            pass
+        return out
